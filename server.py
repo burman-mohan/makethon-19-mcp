@@ -28,6 +28,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import VectorParams, Distance, PointStruct
+from langchain_community.vectorstores.falkordb_vector import generate_random_string
 
 load_dotenv()
 
@@ -141,7 +142,9 @@ async def calculate_days(startDate: str, endDate:str) -> int:
 @mcp_server.tool()
 async def parse_code(directory_path: str, language: str) -> str:
     """
-    Use this tool to parse code
+    Use this tool to parse code.
+    Once the code is parsed this tool will return the name of the Qdrant vector database collection
+    containing the code embeddings.
 
     Args:
         directory_path: Path of the directory
@@ -149,7 +152,7 @@ async def parse_code(directory_path: str, language: str) -> str:
 
 
     Returns:
-        str: Collection name
+        str: Qdrant vector database collection name
     """
 
     print("directory_path: ", directory_path)
@@ -165,12 +168,26 @@ async def parse_code(directory_path: str, language: str) -> str:
     print(f"Parsing code files from directory: {directory_path}")
     print(f"Language specified: {language}")
 
+    suffixes_to_load = [
+        ".py", ".js", ".java", ".c", ".cpp", ".cs", ".go", ".rb", ".php",
+        ".html", ".css", ".ts", ".tsx", ".scala", ".swift", ".kt", ".rs",
+        ".md", ".json", ".yaml", ".sh", ".lua", ".r", ".pl", ".sql"
+        # Add more common ones if needed as a fallback
+    ]
 
+
+    parser = LanguageParser(language=None, parser_threshold=0)
     # Load documents with LanguageParser first
+    # loader = GenericLoader.from_filesystem(
+    #     directory_path,
+    #     suffixes=[".java"],
+    #     parser=LanguageParser(language="java")
+    # )
+
     loader = GenericLoader.from_filesystem(
         directory_path,
-        suffixes=[".java"],
-        parser=LanguageParser(language="java")
+        suffixes=suffixes_to_load,
+        parser=parser
     )
 
     # Load and parse the documents
@@ -189,9 +206,65 @@ async def parse_code(directory_path: str, language: str) -> str:
     #     print(f"Document content: {doc.page_content}")
     #     print(f"Document metadata: {doc.metadata}")
     #     break  # Print only the first document
-    print(all_documents)
+    # print(all_documents)
 
-    return all_documents
+    print("Splitting document...")
+    # Further split with language-aware text splitter
+    js_splitter = RecursiveCharacterTextSplitter.from_language(
+        language=Language.JS,
+        chunk_size=500,
+        chunk_overlap=0
+    )
+    split_docs = js_splitter.split_documents(documents)
+
+    # Initialize the embedding model
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="jinaai/jina-embeddings-v2-base-code"
+    )
+
+    # Create embeddings for the split documents
+    embeddings = embedding_model.embed_documents([doc.page_content for doc in split_docs])
+
+    print(f"Generated embeddings for {len(embeddings)} documents.")
+
+    # Connect to local Qdrant instance
+    qdrant = QdrantClient(host="192.168.1.100", port=6333)
+
+    collection_name = generate_random_string(20)
+
+    # Create collection if it doesn't exist
+    if collection_name not in [c.name for c in qdrant.get_collections().collections]:
+        qdrant.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(
+                size=len(embeddings[0]),
+                distance=Distance.COSINE
+            )
+        )
+
+    # Prepare points for upsert
+    points = [
+        PointStruct(
+            id=i,
+            vector=embeddings[i],
+            payload={
+                "content": split_docs[i].page_content,
+                "metadata": split_docs[i].metadata
+            }
+        )
+        for i in range(len(embeddings))
+    ]
+
+    # Upsert points into Qdrant
+    qdrant.upsert(
+        collection_name=collection_name,
+        points=points
+    )
+
+    print(f"Saved {len(points)} embeddings to Qdrant collection '{collection_name}'.")
+
+    return collection_name
+
 
 
 # @mcp_server.tool()
@@ -329,7 +402,7 @@ async def query_qdrant(
             - score: Similarity score (higher is better)
             - payload: Contains the actual code content and metadata
     """
-    
+    print(f"Received query for collection '{collection_name}' with query text: '{query_text}' and top_k={top_k}")
     try:
         app_resources: AppContext = ctx.request_context.lifespan_context
         qdrant_client = app_resources.qdrant_client
@@ -379,7 +452,7 @@ async def query_qdrant(
 
 
 async def main():
-    await parse_code(r"D:\Codes\Python\makethon-19\final_code\agentFwk\res_code\myFolder-compressed", "java")
+    #await parse_code(r"D:\Codes\Python\makethon-19\final_code\agentFwk\res_code\myFolder-compressed", "java")
     """
     Main asynchronous function to start the MCP server.
     Selects the transport (SSE or STDIO) based on the TRANSPORT environment variable.
